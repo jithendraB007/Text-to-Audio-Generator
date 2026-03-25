@@ -1,113 +1,136 @@
-import { NextResponse } from 'next/server';
-import { exec } from 'child_process';
-import { promisify } from 'util';
-import path from 'path';
-import fs from 'fs';
-import os from 'os';
+import { NextRequest, NextResponse } from 'next/server';
+import { EdgeTTS } from 'edge-tts-universal';
 
-const execAsync = promisify(exec);
+// ─────────────────────────────────────────────────────────────
+//  VOICE MAP  —  Microsoft Edge Neural voices (free, no API key)
+// ─────────────────────────────────────────────────────────────
+const VOICE_MAP: Record<string, { male: string; female: string }> = {
+    'en-US': { female: 'en-US-AriaNeural',    male: 'en-US-GuyNeural'     },
+    'en-GB': { female: 'en-GB-SoniaNeural',   male: 'en-GB-RyanNeural'    },
+    'en-AU': { female: 'en-AU-NatashaNeural', male: 'en-AU-WilliamNeural' },
+    'en-CA': { female: 'en-CA-ClaraNeural',   male: 'en-CA-LiamNeural'    },
+    'en-IN': { female: 'en-IN-NeerjaNeural',  male: 'en-IN-PrabhatNeural' },
+};
 
-export async function POST(req: Request) {
+// Dedicated child voices where Edge TTS has them (en-US female only)
+const CHILD_VOICE_OVERRIDES: Partial<Record<string, { female?: string; male?: string }>> = {
+    'en-US': { female: 'en-US-AnaNeural' },
+};
+
+// ─────────────────────────────────────────────────────────────
+//  GENERATION  —  pitch + rate offsets per age group
+// ─────────────────────────────────────────────────────────────
+type Generation = 'child' | 'young' | 'adult' | 'senior';
+
+const GENERATION_ADJUSTMENTS: Record<Generation, { pitch: string; rateOffset: number }> = {
+    child:  { pitch: '+15Hz', rateOffset: +10 },
+    young:  { pitch: '+6Hz',  rateOffset: +5  },
+    adult:  { pitch: '+0Hz',  rateOffset:  0  },
+    senior: { pitch: '-8Hz',  rateOffset: -10 },
+};
+
+interface SpeakerConfig {
+    gender: 'male' | 'female';
+    accentPreset: string;
+    generation: Generation;
+    speed: number;
+    pauseAfterLineMs: number;
+}
+
+interface ScriptLine {
+    speaker: 'A' | 'B';
+    text: string;
+}
+
+function parseScript(text: string): ScriptLine[] {
+    const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+    const result: ScriptLine[] = [];
+    let cur: 'A' | 'B' = 'A';
+    for (const line of lines) {
+        const up = line.toUpperCase();
+        if (up.startsWith('A:')) {
+            cur = 'A';
+            result.push({ speaker: 'A', text: line.substring(2).trim() });
+        } else if (up.startsWith('B:')) {
+            cur = 'B';
+            result.push({ speaker: 'B', text: line.substring(2).trim() });
+        } else {
+            result.push({ speaker: cur, text: line });
+        }
+    }
+    return result;
+}
+
+function getVoiceName(config: SpeakerConfig): string {
+    const gen = config.generation ?? 'adult';
+    if (gen === 'child') {
+        const override = CHILD_VOICE_OVERRIDES[config.accentPreset];
+        if (override?.[config.gender]) return override[config.gender]!;
+    }
+    const map = VOICE_MAP[config.accentPreset] ?? VOICE_MAP['en-US'];
+    return map[config.gender];
+}
+
+// Convert speed slider (0.5–1.5) + generation offset → Edge TTS rate string
+function buildRate(speed: number, rateOffset: number): string {
+    const pct = Math.round((speed - 1) * 100) + rateOffset;
+    return pct >= 0 ? `+${pct}%` : `${pct}%`;
+}
+
+// Minimal silent MP3 frames for pause between lines (~26ms per frame)
+function silenceBuffer(ms: number): Buffer {
+    const frame = Buffer.from([
+        0xff, 0xfb, 0x90, 0x00,
+        ...new Array(413).fill(0),
+    ]);
+    const count = Math.max(1, Math.ceil(ms / 26));
+    return Buffer.concat(Array.from({ length: count }, () => frame));
+}
+
+export async function POST(req: NextRequest) {
     try {
-        const body = await req.json();
-        const { script, speakers } = body;
-
-        if (!script || !speakers) {
-            return NextResponse.json({ error: 'Missing script or speakers' }, { status: 400 });
-        }
-
-        // Since AI is disallowed and browser JS can't download SpeechSynthesis directly,
-        // we use a native OS-level fallback (PowerShell System.Speech) for Windows users to generate a WAV file natively.
-
-        if (process.platform !== 'win32') {
-            return NextResponse.json({ error: 'Native offline TTS generation requires Windows OS for this No-AI MVP build.' }, { status: 400 });
-        }
-
-        // Prepare temp file path
-        const tempDir = os.tmpdir();
-        const uniqueId = Date.now().toString() + Math.floor(Math.random() * 1000).toString();
-        const wavPath = path.join(tempDir, `accenttalk_${uniqueId}.wav`);
-        const ps1Path = path.join(tempDir, `accenttalk_${uniqueId}.ps1`);
-
-        // We generate a PowerShell script that speaks each line and saves to one WAV file
-        let psScript = `
-Add-Type -AssemblyName System.Speech
-$synth = New-Object System.Speech.Synthesis.SpeechSynthesizer
-$synth.SetOutputToWaveFile("${wavPath.replace(/\\/g, '\\\\')}")
-
-`;
-
-        // Function to parse the script just like frontend
-        const parseScript = (text: string) => {
-            const lines = text.split('\n').map(l => l.trim()).filter(l => l);
-            const result = [];
-            let currentSpeaker = 'A';
-            for (const line of lines) {
-                let textPart = line;
-                const upper = line.toUpperCase();
-                if (upper.startsWith('A:')) {
-                    currentSpeaker = 'A';
-                    textPart = line.substring(2).trim();
-                } else if (upper.startsWith('B:')) {
-                    currentSpeaker = 'B';
-                    textPart = line.substring(2).trim();
-                }
-                result.push({ speaker: currentSpeaker, text: textPart });
-            }
-            return result;
+        const { script, speakers } = await req.json() as {
+            script: string;
+            speakers: { A: SpeakerConfig; B: SpeakerConfig };
         };
 
-        const parsedLines = parseScript(script);
-
-        for (const line of parsedLines) {
-            const config = speakers[line.speaker];
-
-            // Determine best local Windows voice based on gender
-            // David is Male, Zira/Hazel are Female
-            let voiceName = 'Microsoft Zira Desktop'; // default female US
-            if (config.gender === 'male') {
-                voiceName = 'Microsoft David Desktop';
-            } else if (config.accentPreset === 'en-GB') {
-                voiceName = 'Microsoft Hazel Desktop';
-            }
-
-            psScript += `$synth.SelectVoice("${voiceName}")\n`;
-            psScript += `$synth.Rate = ${Math.round((config.speed - 1.0) * 10)}\n`; // System.Speech rate is -10 to 10
-            psScript += `$synth.Speak("${line.text.replace(/"/g, '`"')}")\n`;
-
-            // Add pause roughly using sleep
-            if (config.pauseAfterLineMs > 0) {
-                psScript += `Start-Sleep -Milliseconds ${config.pauseAfterLineMs}\n`;
-            }
+        if (!script?.trim()) {
+            return NextResponse.json({ error: 'Script is empty' }, { status: 400 });
         }
 
-        psScript += `$synth.Dispose()\n`;
+        const lines = parseScript(script).filter(l => l.text.trim());
+        if (lines.length === 0) {
+            return NextResponse.json({ error: 'No valid lines found' }, { status: 400 });
+        }
 
-        // Write PS1 and Execute
-        fs.writeFileSync(ps1Path, psScript, 'utf8');
+        // Process all lines in parallel — much faster, avoids Vercel timeout
+        const lineBuffers = await Promise.all(lines.map(async line => {
+            const config = line.speaker === 'A' ? speakers.A : speakers.B;
+            const gen    = config.generation ?? 'adult';
+            const adj    = GENERATION_ADJUSTMENTS[gen] ?? GENERATION_ADJUSTMENTS.adult;
+            const voice  = getVoiceName(config);
+            const rate   = buildRate(config.speed, adj.rateOffset);
+            const pitch  = adj.pitch;
 
-        await execAsync(`powershell -NoProfile -ExecutionPolicy Bypass -File "${ps1Path}"`);
+            const tts    = new EdgeTTS(line.text, voice, { rate, pitch });
+            const result = await tts.synthesize();
+            const audio  = Buffer.from(await result.audio.arrayBuffer());
+            const pause  = config.pauseAfterLineMs > 0 ? silenceBuffer(config.pauseAfterLineMs) : null;
+            return pause ? Buffer.concat([audio, pause]) : audio;
+        }));
 
-        // Read generated WAV
-        const wavBuffer = fs.readFileSync(wavPath);
-
-        // Cleanup
-        try {
-            fs.unlinkSync(ps1Path);
-            fs.unlinkSync(wavPath);
-        } catch (e) { }
-
-        // Return WAV File
-        return new NextResponse(wavBuffer, {
+        return new NextResponse(Buffer.concat(lineBuffers), {
             status: 200,
             headers: {
-                'Content-Type': 'audio/wav',
-                'Content-Disposition': `attachment; filename="AccentTalk_Export_${uniqueId}.wav"`,
+                'Content-Type': 'audio/mpeg',
+                'Content-Disposition': 'attachment; filename="AccentTalk_output.mp3"',
             },
         });
-
-    } catch (error: any) {
-        console.error("TTS Generation Error:", error);
-        return NextResponse.json({ error: error.message || 'Error generating TTS' }, { status: 500 });
+    } catch (err: any) {
+        console.error('[TTS Error]', err);
+        return NextResponse.json(
+            { error: err.message || 'TTS generation failed' },
+            { status: 500 }
+        );
     }
 }

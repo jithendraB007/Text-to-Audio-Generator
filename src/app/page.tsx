@@ -1,11 +1,13 @@
 "use client";
 
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect } from 'react';
 
-// Types from PRD
+type Generation = 'child' | 'young' | 'adult' | 'senior';
+
 interface SpeakerConfig {
     gender: 'male' | 'female';
     accentPreset: string;
+    generation: Generation;
     speed: number;
     pauseAfterLineMs: number;
 }
@@ -16,139 +18,131 @@ interface ScriptLine {
 }
 
 const ACCENT_PRESETS = [
-    { id: 'en-US', label: 'US English' },
-    { id: 'en-GB', label: 'UK English' },
-    { id: 'en-CA', label: 'Canadian English' },
-    { id: 'en-AU', label: 'Australian English' },
-    { id: 'en-IN', label: 'South East Asian (Style)' },
+    { id: 'en-US', label: 'US English',         female: 'Aria',    male: 'Guy'     },
+    { id: 'en-GB', label: 'UK English',          female: 'Sonia',   male: 'Ryan'    },
+    { id: 'en-AU', label: 'Australian English',  female: 'Natasha', male: 'William' },
+    { id: 'en-CA', label: 'Canadian English',    female: 'Clara',   male: 'Liam'    },
+    { id: 'en-IN', label: 'Indian English',      female: 'Neerja',  male: 'Prabhat' },
+];
+
+const GENERATIONS: { id: Generation; label: string; hint: string }[] = [
+    { id: 'child',  label: 'Child',       hint: 'Higher pitch, slightly faster' },
+    { id: 'young',  label: 'Young Adult', hint: 'Bright, upbeat tone'           },
+    { id: 'adult',  label: 'Adult',       hint: 'Neutral, natural voice'        },
+    { id: 'senior', label: 'Senior',      hint: 'Lower pitch, measured pace'    },
 ];
 
 export default function Home() {
-    const [script, setScript] = useState("A: Hello there! Welcome to AccentTalk.\nB: Hi! This assumes a native browser TTS instead of AI APIs.\nA: Exactly, it's fast and completely free to use.");
-    const [speakerA, setSpeakerA] = useState<SpeakerConfig>({ gender: 'female', accentPreset: 'en-US', speed: 1.0, pauseAfterLineMs: 300 });
-    const [speakerB, setSpeakerB] = useState<SpeakerConfig>({ gender: 'male', accentPreset: 'en-GB', speed: 1.0, pauseAfterLineMs: 300 });
+    const [script, setScript] = useState(
+        "A: Hello there! Welcome to AccentTalk.\nB: Hi! This uses Microsoft Edge's neural voices.\nA: Exactly — real voices, different ages and accents, completely free."
+    );
+    const [speakerA, setSpeakerA] = useState<SpeakerConfig>({
+        gender: 'female', accentPreset: 'en-US', generation: 'young', speed: 1.0, pauseAfterLineMs: 400,
+    });
+    const [speakerB, setSpeakerB] = useState<SpeakerConfig>({
+        gender: 'male', accentPreset: 'en-GB', generation: 'adult', speed: 1.0, pauseAfterLineMs: 400,
+    });
     const [isGenerating, setIsGenerating] = useState(false);
     const [audioUrl, setAudioUrl] = useState<string | null>(null);
-
+    const [statusMsg, setStatusMsg] = useState('');
     const [availableVoices, setAvailableVoices] = useState<SpeechSynthesisVoice[]>([]);
 
-    // Load voices securely on client
     useEffect(() => {
-        const loadVoices = () => {
-            const voices = window.speechSynthesis.getVoices();
-            if (voices.length > 0) {
-                setAvailableVoices(voices);
-            }
+        const load = () => {
+            const v = window.speechSynthesis.getVoices();
+            if (v.length > 0) setAvailableVoices(v);
         };
-        loadVoices();
-        if (speechSynthesis.onvoiceschanged !== undefined) {
-            speechSynthesis.onvoiceschanged = loadVoices;
-        }
+        load();
+        window.speechSynthesis.onvoiceschanged = load;
     }, []);
 
     const parseScript = (text: string): ScriptLine[] => {
-        const lines = text.split('\n').map(l => l.trim()).filter(l => l);
+        const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
         const result: ScriptLine[] = [];
-        let currentSpeaker: 'A' | 'B' = 'A';
-
+        let cur: 'A' | 'B' = 'A';
         for (const line of lines) {
-            const upper = line.toUpperCase();
-            if (upper.startsWith('A:')) {
-                currentSpeaker = 'A';
-                result.push({ speaker: 'A', text: line.substring(2).trim() });
-            } else if (upper.startsWith('B:')) {
-                currentSpeaker = 'B';
-                result.push({ speaker: 'B', text: line.substring(2).trim() });
-            } else {
-                // Inherit previous speaker
-                result.push({ speaker: currentSpeaker, text: line });
-            }
+            const up = line.toUpperCase();
+            if (up.startsWith('A:')) { cur = 'A'; result.push({ speaker: 'A', text: line.substring(2).trim() }); }
+            else if (up.startsWith('B:')) { cur = 'B'; result.push({ speaker: 'B', text: line.substring(2).trim() }); }
+            else result.push({ speaker: cur, text: line });
         }
         return result;
     };
 
-    const getBestVoice = (config: SpeakerConfig) => {
-        // Attempt to find a voice that matches Locale first
-        let possible = availableVoices.filter(v => v.lang.toLowerCase().startsWith(config.accentPreset.toLowerCase()));
-        if (possible.length === 0) possible = availableVoices; // fallback
-
-        // Sort logic to specifically guess gender based on voice name identifiers (Windows & Mac heuristics)
-        let best = possible.find(v => {
-            const name = v.name.toLowerCase();
-            if (config.gender === 'female' && (name.includes('female') || name.includes('girl') || name.includes('samantha') || name.includes('zira') || name.includes('hazel'))) return true;
-            if (config.gender === 'male' && (name.includes('male') || name.includes('boy') || name.includes('david') || name.includes('mark') || name.includes('george'))) return true;
-            return false;
-        });
-
-        return best || possible[0] || availableVoices[0];
+    const voiceLabel = (cfg: SpeakerConfig) => {
+        const preset = ACCENT_PRESETS.find(p => p.id === cfg.accentPreset) ?? ACCENT_PRESETS[0];
+        const name = cfg.gender === 'female' ? preset.female : preset.male;
+        const gen = GENERATIONS.find(g => g.id === cfg.generation)?.label ?? 'Adult';
+        return `${name} · ${gen}`;
     };
 
     const generateAudio = async () => {
-        if (!script.trim()) return alert("Please enter a script.");
+        if (!script.trim()) { alert('Please enter a script.'); return; }
         setIsGenerating(true);
         setAudioUrl(null);
-
-        // Hit our Backend `/api/tts` which uses local Windows OS TTS without external AI APIs!
-        // This perfectly allows true high-quality downloadable MP3/WAV generations entirely offline.
+        setStatusMsg('Generating with Microsoft Edge neural voices…');
         try {
-            const parsedLines = parseScript(script);
-            if (parsedLines.length === 0) throw new Error("No lines found.");
-
-            const response = await fetch('/api/tts', {
+            const res = await fetch('/api/tts', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    script,
-                    speakers: { A: speakerA, B: speakerB }
-                })
+                body: JSON.stringify({ script, speakers: { A: speakerA, B: speakerB } }),
             });
-
-            if (!response.ok) {
-                const errData = await response.json().catch(() => ({}));
-                throw new Error(errData.error || await response.text());
+            if (!res.ok) {
+                const err = await res.json().catch(() => ({}));
+                throw new Error(err.error || `Server error ${res.status}`);
             }
-
-            // Convert response into object URL for HTML audio element
-            const blob = await response.blob();
-            const url = URL.createObjectURL(blob);
-
-            setAudioUrl(url);
+            const blob = await res.blob();
+            setAudioUrl(URL.createObjectURL(blob));
+            setStatusMsg('');
         } catch (e: any) {
-            alert("Error generating Native Audio: " + e.message);
+            alert('Error: ' + e.message);
+            setStatusMsg('');
         } finally {
             setIsGenerating(false);
         }
     };
 
+    const getBestVoice = (cfg: SpeakerConfig) => {
+        let pool = availableVoices.filter(v => v.lang.toLowerCase().startsWith(cfg.accentPreset.toLowerCase()));
+        if (!pool.length) pool = availableVoices;
+        const femaleKw = ['samantha', 'zira', 'hazel', 'victoria', 'karen', 'allison', 'ava', 'female', 'aria', 'sonia', 'natasha'];
+        const maleKw   = ['david', 'mark', 'george', 'daniel', 'alex', 'male', 'guy', 'ryan', 'william'];
+        const kw = cfg.gender === 'female' ? femaleKw : maleKw;
+        return pool.find(v => kw.some(k => v.name.toLowerCase().includes(k))) || pool[0];
+    };
+
+    const generationPitch = (gen: Generation): number => {
+        return { child: 1.4, young: 1.15, adult: 1.0, senior: 0.8 }[gen] ?? 1.0;
+    };
+
     const playLivePreview = () => {
-        if (window.speechSynthesis.speaking) {
-            window.speechSynthesis.cancel();
-            return;
-        }
-        const parsedLines = parseScript(script);
-
-        parsedLines.forEach((line) => {
-            const config = line.speaker === 'A' ? speakerA : speakerB;
-            const utterance = new SpeechSynthesisUtterance(line.text);
-            utterance.voice = getBestVoice(config);
-            utterance.rate = config.speed;
-
-            // Basic pitch heuristic to further force gender distinction if voices are limited
-            if (config.gender === 'male' && utterance.voice?.name.toLowerCase().includes('zira')) {
-                utterance.pitch = 0.5; // Artificial fix if constrained to female 
-            } else if (config.gender === 'female' && utterance.voice?.name.toLowerCase().includes('david')) {
-                utterance.pitch = 1.5; // Artificial fix if constrained to male
-            }
-
-            window.speechSynthesis.speak(utterance);
-        });
+        if (window.speechSynthesis.speaking) { window.speechSynthesis.cancel(); return; }
+        const lines = parseScript(script);
+        let i = 0;
+        const next = () => {
+            if (i >= lines.length) return;
+            const line = lines[i++];
+            const cfg = line.speaker === 'A' ? speakerA : speakerB;
+            const utt = new SpeechSynthesisUtterance(line.text);
+            const v = getBestVoice(cfg);
+            if (v) utt.voice = v;
+            utt.rate  = cfg.speed;
+            utt.lang  = cfg.accentPreset;
+            utt.pitch = generationPitch(cfg.generation);
+            utt.onend = () => setTimeout(next, cfg.pauseAfterLineMs);
+            window.speechSynthesis.speak(utt);
+        };
+        next();
     };
 
     return (
         <div className="app-container">
             <header className="header">
                 <div className="logo">
-                    🎙️ AccentTalk <span style={{ fontSize: '0.8rem', color: '#64748b', fontWeight: 'normal' }}>(Native Offline MVP)</span>
+                    AccentTalk{' '}
+                    <span style={{ fontSize: '0.8rem', color: '#64748b', fontWeight: 'normal' }}>
+                        Microsoft Neural Voices · Free
+                    </span>
                 </div>
                 <button className="btn" style={{ border: '1px solid var(--border-color)', background: 'white' }}>
                     My Projects
@@ -156,96 +150,132 @@ export default function Home() {
             </header>
 
             <main className="main-content">
+                {/* Script editor */}
                 <section className="workspace">
                     <h2>Script Workspace</h2>
                     <div className="editor-container">
                         <div className="editor-toolbar">
-                            <span>{script.length} characters (Max 5000)</span>
-                            <span className="status-badge">Auto-format Active</span>
+                            <span>{script.length} / 5000 characters</span>
+                            <span className="status-badge">A: / B: speaker format</span>
                         </div>
                         <textarea
                             className="script-input"
                             value={script}
                             onChange={e => setScript(e.target.value)}
-                            placeholder="A: Hello&#10;B: Hi there!"
-                        ></textarea>
+                            placeholder={"A: Hello\nB: Hi there!"}
+                        />
                     </div>
+                    {statusMsg && (
+                        <p style={{ marginTop: '1rem', color: 'var(--primary-color)', fontWeight: 500 }}>
+                            {statusMsg}
+                        </p>
+                    )}
                 </section>
 
+                {/* Sidebar config */}
                 <section className="sidebar">
                     <h2>Speaker Configuration</h2>
 
-                    <div className="card">
-                        <h3>Speaker A</h3>
-                        <div className="form-group">
-                            <label>Gender</label>
-                            <select value={speakerA.gender} onChange={e => setSpeakerA({ ...speakerA, gender: e.target.value as 'male' | 'female' })}>
-                                <option value="female">Female</option>
-                                <option value="male">Male</option>
-                            </select>
-                        </div>
-                        <div className="form-group">
-                            <label>Accent Preset</label>
-                            <select value={speakerA.accentPreset} onChange={e => setSpeakerA({ ...speakerA, accentPreset: e.target.value })}>
-                                {ACCENT_PRESETS.map(p => <option key={p.id} value={p.id}>{p.label}</option>)}
-                            </select>
-                        </div>
-                        <div className="form-group">
-                            <label>Speed ({speakerA.speed}x)</label>
-                            <input type="range" min="0.5" max="1.5" step="0.1" value={speakerA.speed} onChange={e => setSpeakerA({ ...speakerA, speed: parseFloat(e.target.value) })} />
-                        </div>
-                    </div>
+                    {(['A', 'B'] as const).map(spk => {
+                        const cfg    = spk === 'A' ? speakerA : speakerB;
+                        const setCfg = spk === 'A' ? setSpeakerA : setSpeakerB;
+                        return (
+                            <div className="card" key={spk}>
+                                <h3>Speaker {spk}</h3>
 
-                    <div className="card">
-                        <h3>Speaker B</h3>
-                        <div className="form-group">
-                            <label>Gender</label>
-                            <select value={speakerB.gender} onChange={e => setSpeakerB({ ...speakerB, gender: e.target.value as 'male' | 'female' })}>
-                                <option value="female">Female</option>
-                                <option value="male">Male</option>
-                            </select>
-                        </div>
-                        <div className="form-group">
-                            <label>Accent Preset</label>
-                            <select value={speakerB.accentPreset} onChange={e => setSpeakerB({ ...speakerB, accentPreset: e.target.value })}>
-                                {ACCENT_PRESETS.map(p => <option key={p.id} value={p.id}>{p.label}</option>)}
-                            </select>
-                        </div>
-                        <div className="form-group">
-                            <label>Speed ({speakerB.speed}x)</label>
-                            <input type="range" min="0.5" max="1.5" step="0.1" value={speakerB.speed} onChange={e => setSpeakerB({ ...speakerB, speed: parseFloat(e.target.value) })} />
-                        </div>
-                    </div>
+                                <div style={{
+                                    background: '#e0e7ff', borderRadius: 6,
+                                    padding: '0.4rem 0.75rem', fontSize: '0.8rem',
+                                    color: 'var(--primary-color)', fontWeight: 600,
+                                    marginBottom: '1rem'
+                                }}>
+                                    {voiceLabel(cfg)}
+                                </div>
 
-                    <button
-                        className="btn btn-primary"
-                        onClick={generateAudio}
-                        disabled={isGenerating || availableVoices.length === 0}
-                    >
-                        {isGenerating ? 'Processing Generation...' : 'Generate & Download Audio'}
+                                <div className="form-group">
+                                    <label>Gender</label>
+                                    <select value={cfg.gender}
+                                        onChange={e => setCfg({ ...cfg, gender: e.target.value as 'male' | 'female' })}>
+                                        <option value="female">Female</option>
+                                        <option value="male">Male</option>
+                                    </select>
+                                </div>
+
+                                <div className="form-group">
+                                    <label>Accent</label>
+                                    <select value={cfg.accentPreset}
+                                        onChange={e => setCfg({ ...cfg, accentPreset: e.target.value })}>
+                                        {ACCENT_PRESETS.map(p => (
+                                            <option key={p.id} value={p.id}>
+                                                {p.label} ({cfg.gender === 'female' ? p.female : p.male})
+                                            </option>
+                                        ))}
+                                    </select>
+                                </div>
+
+                                <div className="form-group">
+                                    <label>Generation / Age</label>
+                                    <select value={cfg.generation}
+                                        onChange={e => setCfg({ ...cfg, generation: e.target.value as Generation })}>
+                                        {GENERATIONS.map(g => (
+                                            <option key={g.id} value={g.id}>
+                                                {g.label} — {g.hint}
+                                            </option>
+                                        ))}
+                                    </select>
+                                </div>
+
+                                <div className="form-group">
+                                    <label>Speed ({cfg.speed}x)</label>
+                                    <input type="range" min="0.5" max="1.5" step="0.1"
+                                        value={cfg.speed}
+                                        onChange={e => setCfg({ ...cfg, speed: parseFloat(e.target.value) })} />
+                                </div>
+
+                                <div className="form-group">
+                                    <label>Pause after line ({cfg.pauseAfterLineMs}ms)</label>
+                                    <input type="range" min="0" max="1500" step="100"
+                                        value={cfg.pauseAfterLineMs}
+                                        onChange={e => setCfg({ ...cfg, pauseAfterLineMs: parseInt(e.target.value) })} />
+                                </div>
+                            </div>
+                        );
+                    })}
+
+                    <button className="btn btn-primary" onClick={generateAudio} disabled={isGenerating}>
+                        {isGenerating ? 'Generating…' : 'Generate Audio (Neural)'}
                     </button>
 
-                    {availableVoices.length === 0 && (
-                        <p style={{ fontSize: '0.8rem', color: 'red', marginTop: '0.5rem' }}>Warning: No browser voices detected. This feature requires Web Speech API support.</p>
-                    )}
+                    <button
+                        className="btn"
+                        style={{ border: '1px solid var(--border-color)', background: 'white', width: '100%', marginTop: '0.5rem' }}
+                        onClick={playLivePreview}
+                        disabled={availableVoices.length === 0}
+                    >
+                        Quick Browser Preview
+                    </button>
 
+                    <div className="card" style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', lineHeight: 1.7 }}>
+                        <strong>Voice Engine</strong><br />
+                        Uses <strong>Microsoft Edge Neural TTS</strong> — high-quality AI voices, free, no API key.<br />
+                        Child, Young Adult, Adult, and Senior voice profiles via pitch and rate shaping.<br />
+                        Preview uses your browser's built-in voices.
+                    </div>
                 </section>
             </main>
 
             {audioUrl && (
                 <footer className="player-bar">
                     <div className="audio-controls">
-                        <audio controls src={audioUrl}>
+                        <audio controls src={audioUrl} autoPlay>
                             Your browser does not support the audio element.
                         </audio>
                     </div>
                     <div style={{ display: 'flex', gap: '1rem', alignItems: 'center' }}>
-                        <button className="btn" style={{ border: '1px solid #64748b', background: 'transparent' }} onClick={playLivePreview}>
-                            ▶ Web Speech Preview
-                        </button>
-                        <a href={audioUrl} download="AccentTalk_Offline.wav">
-                            <button className="btn btn-primary" style={{ margin: 0, padding: '0.5rem 1rem', width: 'auto' }}>
-                                ⬇ Download WAV
+                        <a href={audioUrl} download="AccentTalk_output.mp3">
+                            <button className="btn btn-primary"
+                                style={{ margin: 0, padding: '0.5rem 1rem', width: 'auto' }}>
+                                Download MP3
                             </button>
                         </a>
                     </div>
